@@ -13,7 +13,7 @@ const postSchema = mongoose.Schema({
         trim: true
     },
     userId:{
-        type:mongoose.Schema.types.objectId,
+        type:mongoose.Schema.Types.ObjectID,
         ref:'User',
         required:true,
     }

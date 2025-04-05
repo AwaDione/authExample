@@ -64,3 +64,15 @@ exports.accepFPCodeSchema = Joi.object({
     .required()
     .pattern(new RegExp('^(?=.*[a-z])(?=.*[A-Z])(?=.*\\d).{8,}$')),
 })
+
+exports.createPostSchema = Joi.object({
+    title: Joi.string()
+        .min(6)
+        .max(60)
+        .required(),
+    description: Joi.string()
+        .min(6)
+        .max(600)
+        .required(),
+    userId: Joi.string().required()
+})
