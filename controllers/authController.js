@@ -1,260 +1,151 @@
-const { date } = require("joi");
-const { signupSchema, signinSchema, acceptCodeSchema, changePasswordSchema,accepFPCodeSchema } = require("../middlewares/validator");
-const User = require("../models/usersModel");
-const { doHash, doHashValidation, hmacProcess } = require("../utils/hashing");
-const jwt = require('jsonwebtoken');
-const transport = require('../middlewares/sendMail');
 
-//inscription
-exports.signup = async (req, res) => {
-    const { email, password } = req.body;
-    try {
-        const { error, value } = signupSchema.validate({ email, password });
-        if (error) {
-            return res.status(401).json({ success: false, message: error.details[0].message })
-        }
-        const existingUser = await User.findOne({ email })
-        if (existingUser) {
-            return res.status(401).json({ success: false, message: "l'utilisateur existe déjà!" })
-        }
+// controllers/authController.js
+const Utilisateur = require('../models/utilisateur');
+const Artisan = require('../models/artisan');
+const Categorie = require('../models/categorie');
+const { createToken } = require('../middlewares/auth');
 
-        const hashedPassword = await doHash(password, 12)
-        const newUser = new User({
-            email,
-            password: hashedPassword
-        })
-        const result = await newUser.save();
-        result.password = undefined
-        res.status(201).json({
-            success: true,
-            message: 'Votre compte est crée avec succès',
-            result
-        })
-    } catch (error) {
-        console.log(error);
-
+// Enregistrement d'un utilisateur (client ou artisan)
+// Enregistrement d'un utilisateur (client ou artisan)
+// Enregistrement d'un utilisateur (client ou artisan)
+exports.register = async (req, res, next) => {
+  let newUser = null;
+  
+  try {
+    const { email, motDePasse, nom, prenom, telephone, adresse, role } = req.body;
+    
+    // Vérifier si l'utilisateur existe déjà
+    const existingUser = await Utilisateur.findOne({ email });
+    if (existingUser) {
+      const error = new Error('Un utilisateur avec cet email existe déjà');
+      error.statusCode = 400;
+      throw error;
     }
-}
-
-//connexion
-exports.signin = async (req, res) => {
-    const { email, password } = req.body;
-    try {
-        const { error, value } = signinSchema.validate({ email, password });
-        if (error) {
-            return res.status(401).json({ success: false, message: error.details[0].message })
-        }
-        const existingUser = await User.findOne({ email }).select('+password')
-        if (!existingUser) {
-            return res.status(401).json({ success: false, message: "l'utilisateur n'existe pas!" })
-        }
-        const result = await doHashValidation(password, existingUser.password)
-        if (!result) {
-            return res.status(401).json({ success: false, message: "Email ou mot de passe invalide!" })
-        }
-        const token = jwt.sign({
-            userId: existingUser._id,
-            email: existingUser.email,
-            verified: existingUser.verified,
-
-        }, process.env.TOKEN_SECRET,
-            {
-                expiresIn: '8h'
-            }
-        )
-        res.cookie('Authorization', 'Bearer' + token, {
-            expires: new Date(Date.now() + 8 * 3600000), httpOnly: process.env.NODE_ENV === 'production', secure: process.env.NODE_ENV === 'production'
-        })
-            .json({
-                success: true,
-                token,
-                message: 'connecté avec succès!'
-            })
-    } catch (error) {
-        console.log(error);
-
+    
+    // Créer le nouvel utilisateur
+    newUser = new Utilisateur({
+      email,
+      motDePasse,
+      nom,
+      prenom,
+      telephone,
+      adresse,
+      role
+    });
+    
+    await newUser.save();
+    
+    // Si l'utilisateur est un artisan, créer un profil artisan
+    if (role === 'artisan') {
+      const { typeArtisan, nomEntreprise, categories, description } = req.body;
+      
+      // Vérifier que le type d'artisan est spécifié
+      if (!typeArtisan || !['entreprise', 'freelance'].includes(typeArtisan)) {
+        await Utilisateur.findByIdAndDelete(newUser._id);
+        const error = new Error('Le type d\'artisan doit être "entreprise" ou "freelance"');
+        error.statusCode = 400;
+        throw error;
+      }
+      
+      // Si c'est une entreprise, vérifier que le nom de l'entreprise est fourni
+      if (typeArtisan === 'entreprise' && (!nomEntreprise || nomEntreprise.trim() === '')) {
+        await Utilisateur.findByIdAndDelete(newUser._id);
+        const error = new Error('Le nom de l\'entreprise est requis pour les artisans de type entreprise');
+        error.statusCode = 400;
+        throw error;
+      }
+      
+      // Vérifier que les catégories sont fournies
+      if (!categories || !Array.isArray(categories) || categories.length === 0) {
+        await Utilisateur.findByIdAndDelete(newUser._id);
+        const error = new Error('Au moins une catégorie doit être spécifiée');
+        error.statusCode = 400;
+        throw error;
+      }
+      
+      // Les catégories sont directement stockées comme strings
+      const artisanData = {
+        utilisateur: newUser._id,
+        typeArtisan,
+        categories,
+        description: description || ''
+      };
+      
+      // Ajouter le nom d'entreprise si c'est une entreprise
+      if (typeArtisan === 'entreprise') {
+        artisanData.nomEntreprise = nomEntreprise;
+      }
+      
+      const newArtisan = new Artisan(artisanData);
+      await newArtisan.save();
     }
-}
-
-//deconnexion
-exports.signout = async (req, res) => {
-    res
-        .clearCookie('Authorization')
-        .status(200)
-        .json({ success: true, message: 'déconnecté avec succès' })
-}
-
-//envoyer le code de vérification
-exports.sendVerificationCode = async (req, res) => {
-    const { email } = req.body
-    try {
-        const existingUser = await User.findOne({ email })
-        if (!existingUser) {
-            return res.status(404).json({ success: false, message: "l'utilisateur n'existe pas!" })
-        }
-        if (existingUser.verified) {
-            return res
-                .status(400)
-                .json({ success: false, message: " Vous avez déjà été validé!" })
-        }
-        const codeValue = Math.floor(Math.random() * 1000000).toString()
-        const info = await transport.sendMail({
-            from: process.env.NODE_CODE_SENDING_EMAIL_ADDRESS,
-            to: existingUser.email,
-            subject: 'Votre code de validation',
-            html: codeValue
-
-        })
-        if (info.accepted[0] === existingUser.email) {
-            const hashedCodeValue = hmacProcess(codeValue, process.env.HMAC_VERIFICATION_CODE_SECRET)
-            existingUser.verificationCode = hashedCodeValue;
-            existingUser.verificationCodeValidation = Date.now();
-            await existingUser.save();
-            return res.status(200).json({ success: true, message: 'code envoyé' })
-        }
-        return res.status(400).json({ success: false, message: 'code non envoyé' })
-    } catch (error) {
-        console.log(error);
-
+    
+    // Générer un token JWT
+    const token = createToken(newUser._id, newUser.role);
+    
+    res.status(201).json({
+      success: true,
+      token,
+      user: {
+        id: newUser._id,
+        email: newUser.email,
+        nom: newUser.nom,
+        prenom: newUser.prenom,
+        role: newUser.role
+      }
+    });
+  } catch (error) {
+    // Si une erreur se produit et qu'un utilisateur a été créé, le supprimer
+    if (newUser && newUser._id) {
+      try {
+        await Utilisateur.findByIdAndDelete(newUser._id);
+      } catch (deleteError) {
+        console.error('Erreur lors de la suppression de l\'utilisateur orphelin:', deleteError);
+      }
     }
-}
-
-//vérifier le code de vérification
-exports.verifyVerificationCode = async (req, res) => {
-    const { email, providedCode } = req.body;
-    try {
-        const { error, value } = acceptCodeSchema.validate({ email, providedCode });
-        if (error) {
-            return res.status(401).json({ success: false, message: error.details[0].message })
-        }
-
-        const codeValue = providedCode.toString()
-        const existingUser = await User.findOne({ email }).select("+verificationCode +verificationCodeValidation")
-
-        if (!existingUser) {
-            return res.status(401).json({ success: false, message: "l'utilisateur n'existe pas!" })
-        }
-        if (existingUser.verified) {
-            return res.status(400).json({ success: false, message: "Vérification déjà effectuée!" })
-        }
-        if (!existingUser.verificationCode || !existingUser.verificationCodeValidation) {
-            return res.status(400).json({ success: false, message: "code invalide!" })
-        }
-        if (Date.now() - existingUser.verificationCodeValidation > 5 * 60 * 1000) {
-            return res.status(400).json({ success: false, message: "le code a expiré!" })
-        }
-        const hashedCodeValue = hmacProcess(codeValue, process.env.HMAC_VERIFICATION_CODE_SECRET)
-
-        if (hashedCodeValue === existingUser.verificationCode) {
-            existingUser.verified = true
-            existingUser.verificationCode = undefined
-            existingUser.verificationCodeValidation = undefined
-            await existingUser.save()
-            return res.status(200).json({ success: true, message: "Vérification réussie !" })
-        }
-
-        return res.status(400).json({ success: false, message: "informations invalides!" })
-    } catch (error) {
-        console.log(error);
-
+    next(error);
+  }
+};
+// Connexion d'un utilisateur
+exports.login = async (req, res, next) => {
+  try {
+    const { email, motDePasse } = req.body;
+    
+    // Vérifier si l'utilisateur existe
+    const user = await Utilisateur.findOne({ email });
+    if (!user) {
+      const error = new Error('Email ou mot de passe incorrect');
+      error.statusCode = 401;
+      throw error;
     }
-}
-
-exports.changePassword = async (req, res) => {
-    const { userId, verified } = req.user;
-    const { oldPassword, newPassword } = req.body
-    try {
-        const { error, value } = changePasswordSchema.validate({ oldPassword, newPassword })
-        if (error) {
-            return res.status(401).json({ success: false, message: error.details[0].message })
-        }
-     
-        const existingUser = await User.findOne({_id:userId}).select(' +password ')
-        if(!existingUser){
-            res.status(401).json({ success: false, message: ' l\'utilisateur n\'existe pas!'})
-        }
-        const result = await doHashValidation(oldPassword,existingUser.password)
-        if (!result) {
-            
-        return res.status(400).json({ success: false, message: "informations invalides!" })
-        }
-        const hashedPassword = await doHash(newPassword,12)
-        existingUser.password = hashedPassword
-        await existingUser.save()
-        return res.status(200).json({ success: true, message: "Mot de passe changé avec succès" })
-    } catch (error) {
-        console.log(error);
-
+    
+    // Vérifier le mot de passe
+    const isMatch = await user.comparePassword(motDePasse);
+    if (!isMatch) {
+      const error = new Error('Email ou mot de passe incorrect');
+      error.statusCode = 401;
+      throw error;
     }
-}
-
-//envoyer le code du mot de pass oublié
-exports.sendForgotPasswordCode = async (req, res) => {
-    const { email } = req.body
-    try {
-        const existingUser = await User.findOne({ email })
-        if (!existingUser) {
-            return res.status(404).json({ success: false, message: "l'utilisateur n'existe pas!" })
-        }
-     
-        const codeValue = Math.floor(Math.random() * 1000000).toString()
-        const info = await transport.sendMail({
-            from: process.env.NODE_CODE_SENDING_EMAIL_ADDRESS,
-            to: existingUser.email,
-            subject: 'Votre code de validation pour le mot de passe oublié',
-            html: codeValue
-
-        })
-        if (info.accepted[0] === existingUser.email) {
-            const hashedCodeValue = hmacProcess(codeValue, process.env.HMAC_VERIFICATION_CODE_SECRET)
-            existingUser.forgotPasswordCode = hashedCodeValue;
-            existingUser.forgotPasswordCodeValidation = Date.now();
-            await existingUser.save();
-            return res.status(200).json({ success: true, message: 'code envoyé' })
-        }
-        return res.status(400).json({ success: false, message: 'code non envoyé' })
-    } catch (error) {
-        console.log(error);
-
-    }
-}
-
-//vérifier le code de vérification
-exports.verifyForgotPasswordCode = async (req, res) => {
-    const { email, providedCode, newPassword } = req.body;
-    try {
-        const { error, value } = accepFPCodeSchema.validate({ email, providedCode, newPassword });
-        if (error) {
-            return res.status(401).json({ success: false, message: error.details[0].message })
-        }
-
-        const codeValue = providedCode.toString()
-        const existingUser = await User.findOne({ email }).select("+forgotPasswordCode +forgotPasswordCodeValidation")
-
-        if (!existingUser) {
-            return res.status(401).json({ success: false, message: "l'utilisateur n'existe pas!" })
-        }
-
-        if (!existingUser.forgotPasswordCode || !existingUser.forgotPasswordCodeValidation) {
-            return res.status(400).json({ success: false, message: "code invalide!" })
-        }
-        if (Date.now() - existingUser.forgotPasswordCodeValidation > 5 * 60 * 1000) {
-            return res.status(400).json({ success: false, message: "le code a expiré!" })
-        }
-        const hashedCodeValue = hmacProcess(codeValue, process.env.HMAC_VERIFICATION_CODE_SECRET)
-
-        if (hashedCodeValue === existingUser.forgotPasswordCode) {
-            const hashedPassword = await doHash(newPassword, 12)
-            existingUser.password = hashedPassword
-            existingUser.forgotPasswordCode = undefined
-            existingUser.forgotPasswordCodeValidation = undefined
-            await existingUser.save()
-            return res.status(200).json({ success: true, message: "Mot de passe changé avec succès !" })
-        }
-
-        return res.status(400).json({ success: false, message: "informations invalides!" })
-    } catch (error) {
-        console.log(error);
-
-    }
-}
+    
+    // Mettre à jour la date de dernière connexion
+    user.dernierConnexion = Date.now();
+    await user.save();
+    
+    // Générer un token JWT
+    const token = createToken(user._id, user.role);
+    
+    res.status(200).json({
+      success: true,
+      token,
+      user: {
+        id: user._id,
+        email: user.email,
+        nom: user.nom,
+        prenom: user.prenom,
+        role: user.role
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
